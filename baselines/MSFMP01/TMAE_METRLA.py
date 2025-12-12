@@ -4,7 +4,7 @@ from easydict import EasyDict
 sys.path.append(os.path.abspath(__file__ + '/../../..'))
 
 from basicts.metrics import masked_mae, masked_mape, masked_rmse
-from .arch.mask.mae_loss import mae_loss_cl
+from .arch.mask.mse_cl_loss import mse_cl_loss
 from basicts.scaler import ZScoreScaler
 from basicts.data import TimeSeriesForecastingDataset
 from basicts.utils import get_regular_settings
@@ -122,7 +122,7 @@ CFG.TRAIN.CKPT_SAVE_DIR = os.path.join(
     CFG.MODEL.NAME,
     '_'.join([DATA_NAME, str(CFG.TRAIN.NUM_EPOCHS), str(INPUT_LEN), str(OUTPUT_LEN)])
 )
-CFG.TRAIN.LOSS = mae_loss_cl
+CFG.TRAIN.LOSS = mse_cl_loss
 # Optimizer settings
 CFG.TRAIN.OPTIM = EasyDict()
 CFG.TRAIN.OPTIM.TYPE = "Adam"
@@ -141,7 +141,7 @@ CFG.TRAIN.LR_SCHEDULER.PARAM = {
 }
 # Train data loader settings
 CFG.TRAIN.DATA = EasyDict()
-CFG.TRAIN.DATA.BATCH_SIZE = 8
+CFG.TRAIN.DATA.BATCH_SIZE = 4
 CFG.TRAIN.DATA.SHUFFLE = True
 CFG.TRAIN.DATA.NUM_WORKERS = 2
 CFG.TRAIN.DATA.PIN_MEMORY = True
@@ -154,7 +154,7 @@ CFG.TRAIN.EARLY_STOPPING_PATIENCE = 20
 CFG.VAL = EasyDict()
 CFG.VAL.INTERVAL = 1
 CFG.VAL.DATA = EasyDict()
-CFG.VAL.DATA.BATCH_SIZE = 8
+CFG.VAL.DATA.BATCH_SIZE = 4
 CFG.VAL.DATA.NUM_WORKERS = 2
 CFG.VAL.DATA.PIN_MEMORY = True
 
@@ -162,7 +162,7 @@ CFG.VAL.DATA.PIN_MEMORY = True
 CFG.TEST = EasyDict()
 CFG.TEST.INTERVAL = 1
 CFG.TEST.DATA = EasyDict()
-CFG.TEST.DATA.BATCH_SIZE = 8
+CFG.TEST.DATA.BATCH_SIZE = 4
 CFG.TEST.DATA.NUM_WORKERS = 2
 CFG.TEST.DATA.PIN_MEMORY = True
 

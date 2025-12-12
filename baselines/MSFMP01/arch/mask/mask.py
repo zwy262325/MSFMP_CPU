@@ -12,6 +12,7 @@ from .tools import ContrastiveWeight, AggregationRebuild
 from .tools import DataEmbedding
 from .layers.Transformer_EncDec import Decoder, DecoderLayer, Encoder, EncoderLayer
 from .layers.SelfAttention_Family import DSAttention, AttentionLayer, ProbAttention
+from .layers.losses import AutomaticWeightedLoss
 
 
 class Pooler_Head(nn.Module):
@@ -74,6 +75,8 @@ class Mask(nn.Module):
         self.lm = simMTM_args.lm  # 几何分布的平均掩蔽长度（仅当distribution='geometric'时使用）
         self.positive_nums = simMTM_args.positive_nums # 数据的副本数量
         self.masked_data = masked_data
+        self.mse = torch.nn.MSELoss()
+        self.awl = AutomaticWeightedLoss(2)
 
         # encoder_new
         self.encoder_new = TransformerLayers(32, encoder_depth, mlp_ratio, num_heads, dropout)
@@ -123,27 +126,26 @@ class Mask(nn.Module):
 
         x_enc = x_enc.float()
         mask_index = mask_index.float()
-        #
-        # ===================== 步骤1：输入数据基础校验 =====================
-        print("===== 输入数据基础校验 =====")
-        # 检查输入是否含NaN/inf
-        has_nan_x = torch.isnan(x_enc).any().item()
-        has_inf_x = torch.isinf(x_enc).any().item()
-        has_nan_mask = torch.isnan(mask_index).any().item()
-        has_inf_mask = torch.isinf(mask_index).any().item()
-        print(f"x_enc含NaN: {has_nan_x}, 含inf: {has_inf_x}")
-        print(f"mask_index含NaN: {has_nan_mask}, 含inf: {has_inf_mask}")
-        #
-        # 打印mask_index的统计信息（关键：有效数是否为0）
-        mask_sum = torch.sum(mask_index == 1, dim=2)  # 形状(16,207,32)
-        mask_min = mask_sum.min().item()
-        mask_max = mask_sum.max().item()
-        mask_zero_count = (mask_sum == 0).sum().item()
-        print(f"mask_sum{mask_sum}")
-        print(f"mask_min{mask_min}")
-        print(f"mask_max{mask_max}")
 
-        print(f"mask有效数(mask_sum)统计 - 最小值: {mask_min}, 最大值: {mask_max}, 全0数量: {mask_zero_count}")
+        # # ===================== 步骤1：输入数据基础校验 =====================
+        # print("===== 输入数据基础校验 =====")
+        # # 检查输入是否含NaN/inf
+        # has_nan_x = torch.isnan(x_enc).any().item()
+        # has_inf_x = torch.isinf(x_enc).any().item()
+        # has_nan_mask = torch.isnan(mask_index).any().item()
+        # has_inf_mask = torch.isinf(mask_index).any().item()
+        # print(f"x_enc含NaN: {has_nan_x}, 含inf: {has_inf_x}")
+        # print(f"mask_index含NaN: {has_nan_mask}, 含inf: {has_inf_mask}")
+        # # 打印mask_index的统计信息（关键：有效数是否为0）
+        # mask_sum = torch.sum(mask_index == 1, dim=2)  # 形状(16,207,32)
+        # mask_min = mask_sum.min().item()
+        # mask_max = mask_sum.max().item()
+        # mask_zero_count = (mask_sum == 0).sum().item()
+        # print(f"mask_sum{mask_sum}")
+        # print(f"mask_min{mask_min}")
+        # print(f"mask_max{mask_max}")
+        #
+        # print(f"mask有效数(mask_sum)统计 - 最小值: {mask_min}, 最大值: {mask_max}, 全0数量: {mask_zero_count}")
 
         #归一化,处理缺失值x_enc(8,48,7)
         means = torch.sum(x_enc, dim=2) / torch.sum(mask_index == 1, dim=2)
@@ -153,41 +155,40 @@ class Mask(nn.Module):
         stdev = torch.sqrt(torch.sum(x_enc * x_enc, dim=2) / torch.sum(mask_index == 1, dim=2) + 1e-5)
         stdev = stdev.unsqueeze(2).detach()
         x_enc /= stdev
-        #
-        print("x_enc1:", x_enc.max())
-        print("x_enc1:", x_enc.min())
-        print("x_enc1:", x_enc.mean())
-        print("stdev:", stdev.max())
-        print("stdev:", stdev.min())
-        print("stdev:", stdev.mean())
-        print("means:", means.max())
-        print("means:", means.min())
-        print("means:", means.mean())
+
+        # print("x_enc1:", x_enc.max())
+        # print("x_enc1:", x_enc.min())
+        # print("x_enc1:", x_enc.mean())
+        # print("stdev:", stdev.max())
+        # print("stdev:", stdev.min())
+        # print("stdev:", stdev.mean())
+        # print("means:", means.max())
+        # print("means:", means.min())
+        # print("means:", means.mean())
 
         bs, node, seq_len, n_vars = x_enc.shape
 
         # 通道独立处理x_enc(56,48,1) 批次和特征相乘,48为时间步长
-        x_enc = x_enc.permute(0, 3, 1, 2)  # x_enc: [bs x n_vars x seq_len]
-        x_enc = x_enc.unsqueeze(-1)  # x_enc: [bs x n_vars x seq_len x 1]
-        x_enc = x_enc.reshape(-1, node, seq_len, 1)  # x_enc: [(bs * n_vars) x seq_len x 1]
+        x_enc = x_enc.permute(0, 3, 1, 2)
+        x_enc = x_enc.unsqueeze(-1)
+        x_enc = x_enc.reshape(-1, node, seq_len, 1)
 
         # 特征维度转换1->128
         enc_out = self.enc_embedding(x_enc)
 
         # 5.节点特征提取 encoder point-wise representation p_enc_out(56,48,128) 使用Transformer
-        p_enc_out, _ = self.encoder(enc_out)  # p_enc_out: [(bs * n_vars) x seq_len x d_model]
-        # p_enc_out = self.encoder_new(enc_out)  # p_enc_out: [(bs * n_vars) x seq_len x d_model]
+        p_enc_out, _ = self.encoder(enc_out)
+        # p_enc_out = self.encoder_new(enc_out)
 
         # 6.序列特征提取 series-wise representation s_enc_out(56,128) 使用MLP将48个时间步的信息压缩到一个固定长度的向量中
-        s_enc_out = self.pooler(p_enc_out)  # s_enc_out: [(bs * n_vars) x dimension]
+        s_enc_out = self.pooler(p_enc_out)
 
         # 7.对比学习(序列相似度计算+对比损失计算)
-        # loss_cl KL散度的损失值,惩罚和奖励 similarity_matrix(56,56)相似度矩阵 logits(56,55)合并正负样本相似度 positives_mask(56,56)正样本掩码
         loss_cl, similarity_matrix, logits, positives_mask = self.contrastive(s_enc_out)  # similarity_matrix: [(bs * n_vars) x (bs * n_vars)]
 
         # 8.节点聚合(基于相似度矩阵对节点特征进行加权平均,每个样本用其他样本特征增强自己)
         # 重建权重矩阵(56,56)  加强后的序列agg_enc_out(56,48,128)
-        rebuild_weight_matrix, agg_enc_out = self.aggregation(similarity_matrix, p_enc_out)  # agg_enc_out: [(bs * n_vars) x seq_len x d_model]
+        rebuild_weight_matrix, agg_enc_out = self.aggregation(similarity_matrix, p_enc_out)
 
         #  9.agg_enc_out(8,7,48,128)
         agg_enc_out = agg_enc_out.reshape(bs, node, n_vars, seq_len, -1)
@@ -203,10 +204,15 @@ class Mask(nn.Module):
         dec_out = self.fc_patch_size(dec_out)
         dec_out = dec_out.view(batch_size * (self.positive_nums + 1), num_nodes, 1, -1)
 
-        # 11.从重建的8个样本中，取出前2个pred_batch_x (2,48,7)
         dec_out = dec_out[:batch_size]
 
-        return dec_out, long_term_history, loss_cl
+        # 重建损失计算
+        loss_rb = self.mse(dec_out, long_term_history.detach())
+
+        # 总体损失计算
+        loss = self.awl(loss_cl, loss_rb)
+
+        return dec_out, long_term_history, loss
 
     def encoding(self, long_term_history):
         mid_patches = self.patch_embedding(long_term_history)  # B, N, d, P (8,207,1,864)

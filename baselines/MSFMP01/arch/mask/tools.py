@@ -13,8 +13,36 @@ class ContrastiveWeight(nn.Module):
         self.temperature = temperature
         self.softmax = torch.nn.Softmax(dim=-1)
         self.log_softmax = torch.nn.LogSoftmax(dim=-1)
-        self.kl = torch.nn.KLDivLoss(reduction='sum')
+        self.kl = torch.nn.KLDivLoss(reduction='batchmean')
         self.positive_nums = positive_nums
+
+    # def get_positive_and_negative_mask(self, similarity_matrix, cur_batch_size):
+    #     diag = np.eye(cur_batch_size)
+    #     mask = torch.from_numpy(diag)
+    #     mask = mask.type(torch.bool)
+    #
+    #     oral_batch_size = cur_batch_size // (self.positive_nums + 1)
+    #     B_D, _, _ = similarity_matrix.shape
+    #     positives_mask = np.zeros(similarity_matrix.size())
+    #     for i in range(self.positive_nums + 1):
+    #         ll = np.eye(cur_batch_size, cur_batch_size, k=oral_batch_size * i)
+    #         lr = np.eye(cur_batch_size, cur_batch_size, k=-oral_batch_size * i)
+    #
+    #         ll = np.expand_dims(ll, axis=0)
+    #         lr = np.expand_dims(lr, axis=0)
+    #         ll = np.repeat(ll, B_D, axis=0)
+    #         lr = np.repeat(lr, B_D, axis=0)
+    #
+    #         positives_mask += ll
+    #         positives_mask += lr
+    #
+    #     positives_mask = torch.from_numpy(positives_mask).to(similarity_matrix.device)
+    #     positives_mask[..., mask] = 0
+    #
+    #     negatives_mask = 1 - positives_mask
+    #     negatives_mask[..., mask] = 0
+    #
+    #     return positives_mask.type(torch.bool), negatives_mask.type(torch.bool)
 
     def get_positive_and_negative_mask(self, similarity_matrix, cur_batch_size):
         diag = np.eye(cur_batch_size)
@@ -22,57 +50,114 @@ class ContrastiveWeight(nn.Module):
         mask = mask.type(torch.bool)
 
         oral_batch_size = cur_batch_size // (self.positive_nums + 1)
-        B_D, _, _ = similarity_matrix.shape
+
         positives_mask = np.zeros(similarity_matrix.size())
         for i in range(self.positive_nums + 1):
             ll = np.eye(cur_batch_size, cur_batch_size, k=oral_batch_size * i)
             lr = np.eye(cur_batch_size, cur_batch_size, k=-oral_batch_size * i)
-
-            ll = np.expand_dims(ll, axis=0)
-            lr = np.expand_dims(lr, axis=0)
-            ll = np.repeat(ll, B_D, axis=0)
-            lr = np.repeat(lr, B_D, axis=0)
-
             positives_mask += ll
             positives_mask += lr
 
         positives_mask = torch.from_numpy(positives_mask).to(similarity_matrix.device)
-        positives_mask[..., mask] = 0
+        positives_mask[mask] = 0
 
         negatives_mask = 1 - positives_mask
-        negatives_mask[..., mask] = 0
+        negatives_mask[mask] = 0
 
         return positives_mask.type(torch.bool), negatives_mask.type(torch.bool)
 
+    # def forward(self, batch_emb_om):
+    #     cur_batch_shape = batch_emb_om.shape
+    #
+    #     # 1.计算序列的相似度矩阵batch_emb_om(7*8,128),similarity_matrix(56,56)
+    #     norm_emb = F.normalize(batch_emb_om, dim=2)
+    #     new_norm_emb = norm_emb.transpose(0, 1)
+    #     similarity_matrix = torch.matmul(new_norm_emb, new_norm_emb.transpose(-2, -1))
+    #
+    #     # 2.获取正样本和负样本的掩码,true表示第i个序列和第j个序列是正样本对, 布尔类型positives_mask(56,56), negatives_mask(56,56)
+    #     positives_mask, negatives_mask = self.get_positive_and_negative_mask(similarity_matrix, cur_batch_shape[0])
+    #
+    #     # 3.根据掩码获取正样本和负样本的相似度值,positives(56,3), negatives(56,52), 缺少的一个是样本本身
+    #     positives = similarity_matrix[positives_mask].view(cur_batch_shape[1], cur_batch_shape[0], -1)
+    #     negatives = similarity_matrix[negatives_mask].view(cur_batch_shape[1], cur_batch_shape[0], -1)
+    #
+    #     # 4.合并正负样本相似度, 每行包含: [正1, 正2, 正3, 负1, 负2, ..., 负52] logits(56,55)
+    #     logits = torch.cat((positives, negatives), dim=-1)
+    #     # 5.构建标签, 前面3个为正样本，后面52个为负样本  y_true(56,55)
+    #     y_true = torch.cat((torch.ones(cur_batch_shape[1], cur_batch_shape[0], positives.shape[-1]), torch.zeros(cur_batch_shape[1], cur_batch_shape[0], negatives.shape[-1])), dim=-1).to(batch_emb_om.device).float()
+    #
+    #     # 6.对相似度除以温度系数后取log_softmax 得到概率分布的对数形式
+    #     predict = self.log_softmax(logits / self.temperature)
+    #
+    #     # 7.使用KL散度损失,使预测分布与理想分布接近
+    #     loss = self.kl(predict, y_true)
+    #
+    #     normalization_term = cur_batch_shape[1] * cur_batch_shape[0] * positives.shape[-1]
+    #     loss = loss / normalization_term
+    #
+    #     return loss, similarity_matrix, logits, positives_mask
+
     def forward(self, batch_emb_om):
-        cur_batch_shape = batch_emb_om.shape
+        # batch_emb_om形状: (T, N, D)
+        cur_batch_shape = batch_emb_om.shape  # (T, N, D)
 
-        # 1.计算序列的相似度矩阵batch_emb_om(7*8,128),similarity_matrix(56,56)
-        norm_emb = F.normalize(batch_emb_om, dim=2)
-        new_norm_emb = norm_emb.transpose(0, 1)
-        similarity_matrix = torch.matmul(new_norm_emb, new_norm_emb.transpose(-2, -1))
+        # 对每个节点的特征进行归一化
+        norm_emb = F.normalize(batch_emb_om, dim=2)  # (T, N, D)
 
-        # 2.获取正样本和负样本的掩码,true表示第i个序列和第j个序列是正样本对, 布尔类型positives_mask(56,56), negatives_mask(56,56)
-        positives_mask, negatives_mask = self.get_positive_and_negative_mask(similarity_matrix, cur_batch_shape[0])
+        # 转置以便向量化计算
+        # 形状: (N, T, D)
+        norm_emb_transposed = norm_emb.transpose(0, 1)
 
-        # 3.根据掩码获取正样本和负样本的相似度值,positives(56,3), negatives(56,52), 缺少的一个是样本本身
-        positives = similarity_matrix[positives_mask].view(cur_batch_shape[1], cur_batch_shape[0], -1)
-        negatives = similarity_matrix[negatives_mask].view(cur_batch_shape[1], cur_batch_shape[0], -1)
+        # 计算批处理相似度矩阵
+        # 使用torch.matmul的批处理功能
+        similarity_matrix = torch.matmul(
+            norm_emb_transposed,  # (N, T, D)
+            norm_emb_transposed.transpose(1, 2)  # (N, D, T)
+        )  # 结果形状: (N, T, T)
 
-        # 4.合并正负样本相似度, 每行包含: [正1, 正2, 正3, 负1, 负2, ..., 负52] logits(56,55)
-        logits = torch.cat((positives, negatives), dim=-1)
-        # 5.构建标签, 前面3个为正样本，后面52个为负样本  y_true(56,55)
-        y_true = torch.cat((torch.ones(cur_batch_shape[1], cur_batch_shape[0], positives.shape[-1]), torch.zeros(cur_batch_shape[1], cur_batch_shape[0], negatives.shape[-1])), dim=-1).to(batch_emb_om.device).float()
+        # 初始化存储
+        batch_size_T = cur_batch_shape[0]
+        batch_size_N = cur_batch_shape[1]
 
-        # 6.对相似度除以温度系数后取log_softmax 得到概率分布的对数形式
-        predict = self.log_softmax(logits / self.temperature)
-        # 7.使用KL散度损失,使预测分布与理想分布接近
-        loss = self.kl(predict, y_true)
+        total_loss = 0
+        all_logits = []
 
-        normalization_term = cur_batch_shape[1] * cur_batch_shape[0] * positives.shape[-1]
-        loss = loss / normalization_term
+        # 对每个节点独立处理mask和loss计算
+        for n in range(batch_size_N):
+            node_sim_matrix = similarity_matrix[n]  # (T, T)
 
-        return loss, similarity_matrix, logits, positives_mask
+            # 获取正负样本mask
+            positives_mask, negatives_mask = self.get_positive_and_negative_mask(
+                node_sim_matrix, batch_size_T)
+
+            # 提取正负样本
+            num_positives = positives_mask.sum() // batch_size_T
+            num_negatives = negatives_mask.sum() // batch_size_T
+
+            positives = node_sim_matrix[positives_mask].view(batch_size_T, num_positives)
+            negatives = node_sim_matrix[negatives_mask].view(batch_size_T, num_negatives)
+
+            # 构建logits和labels
+            logits = torch.cat((positives, negatives), dim=-1)  # (T, num_pos+num_neg)
+            y_true = torch.cat((
+                torch.ones(batch_size_T, num_positives),
+                torch.zeros(batch_size_T, num_negatives)
+            ), dim=-1).to(batch_emb_om.device).float()
+
+            # 计算loss
+            predict = self.log_softmax(logits / self.temperature)
+            node_loss = self.kl(predict, y_true)
+
+            total_loss += node_loss
+            all_logits.append(logits.unsqueeze(0))
+
+        # 平均loss
+        avg_loss = total_loss / batch_size_N
+
+        # 合并logits
+        logits_all = torch.cat(all_logits, dim=0)  # (N, T, num_samples)
+
+        return avg_loss, similarity_matrix, logits_all, None
 
 
 class AggregationRebuild(torch.nn.Module):
